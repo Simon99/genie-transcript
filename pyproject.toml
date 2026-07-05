@@ -1,0 +1,15 @@
+[project]
+name = "genie-transcript"
+version = "0.1.0"
+description = "Meeting recording/transcript to structured notes with timestamp tracing"
+requires-python = ">=3.9"
+dependencies = [
+    "genie-core @ git+https://github.com/Simon99/genie-core.git",
+]
+
+[project.scripts]
+genie-transcript = "genie_transcript.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
