@@ -67,24 +67,59 @@ def structurize_transcript(
     srt_path = output_dir / "transcript.srt"
     _write_srt(segments, str(srt_path))
 
-    # Step 2: Send to LLM for structuring
+    # Step 2: Send to LLM for structuring (chunked for long transcripts)
     if progress_callback:
         progress_callback("structuring", 0.4)
 
-    transcript_text = _format_transcript_for_llm(segments)
-
     llm = LMStudioClient(base_url=lm_studio_url, model=llm_model)
-    raw_response = llm.complete(
-        prompt=f"Analyze this meeting transcript and produce structured notes:\n\n{transcript_text}",
-        system=SYSTEM_PROMPT,
-        temperature=0.2,
-    )
+
+    # Split into ~5 minute chunks to fit context window
+    chunk_size = 50
+    chunks = [segments[i:i + chunk_size] for i in range(0, len(segments), chunk_size)]
+
+    if len(chunks) <= 1:
+        transcript_text = _format_transcript_for_llm(segments)
+        raw_response = llm.complete(
+            prompt="Analyze this meeting transcript and produce structured notes:\n\n%s" % transcript_text,
+            system=SYSTEM_PROMPT,
+            temperature=0.2,
+        )
+        structured = _parse_llm_response(raw_response)
+    else:
+        # Multi-chunk: summarize each chunk, then synthesize
+        chunk_summaries = []
+        for ci, chunk in enumerate(chunks):
+            if progress_callback:
+                progress_callback("structuring", 0.4 + 0.3 * (ci + 1) / len(chunks))
+
+            chunk_text = _format_transcript_for_llm(chunk)
+            raw = llm.complete(
+                prompt="Analyze this transcript chunk (%d/%d) and produce structured notes:\n\n%s" % (
+                    ci + 1, len(chunks), chunk_text),
+                system=SYSTEM_PROMPT,
+                temperature=0.2,
+            )
+            chunk_summaries.append(_parse_llm_response(raw))
+
+        # Synthesize all chunk summaries
+        if progress_callback:
+            progress_callback("synthesizing", 0.75)
+
+        synthesis_input = json.dumps(chunk_summaries, ensure_ascii=False)
+        raw_response = llm.complete(
+            prompt=(
+                "You have %d chunk summaries from a meeting. "
+                "Merge them into ONE final structured report. "
+                "Combine related topics, keep all timestamps and source references.\n\n%s"
+            ) % (len(chunk_summaries), synthesis_input),
+            system=SYSTEM_PROMPT,
+            temperature=0.2,
+        )
+        structured = _parse_llm_response(raw_response)
 
     # Parse and save structured output
     if progress_callback:
         progress_callback("saving", 0.8)
-
-    structured = _parse_llm_response(raw_response)
 
     structured_path = output_dir / "structured.json"
     structured_path.write_text(json.dumps(structured, ensure_ascii=False, indent=2), encoding="utf-8")
