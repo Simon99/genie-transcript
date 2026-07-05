@@ -112,6 +112,23 @@ def structurize_transcript(
     }
 
 
+def _write_srt(segments: list[dict], output_path: str):
+    """Write segments to SRT format."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segments, 1):
+            start = _format_srt_time(seg["start"])
+            end = _format_srt_time(seg["end"])
+            f.write(f"{i}\n{start} --> {end}\n{seg['text']}\n\n")
+
+
+def _format_srt_time(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def _load_or_transcribe(input_path: str, language: str, model: str) -> list[dict]:
     """Load existing transcript or run whisper."""
     p = Path(input_path)
