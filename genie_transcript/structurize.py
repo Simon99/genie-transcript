@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 
 from genie_core.audio import transcribe_audio
-from genie_core.llm import LMStudioClient
+from genie_core.audio.loader import load_transcript
+from genie_core.audio.srt import write_srt
+from genie_core.llm import LMStudioClient, extract_json, merge_structured
+from genie_core.report import esc, html_page
+from genie_core.text import format_time
 
 
 SYSTEM_PROMPT = """You are a meeting analyst. Given a timestamped transcript, produce a structured JSON summary.
@@ -37,6 +41,45 @@ Rules:
 - Output ONLY valid JSON, no explanations"""
 
 
+# Self-contained merge instructions (merge_structured sends this as the user
+# prompt with the JSON array of summaries appended; no system prompt).
+SYNTHESIS_MERGE_PROMPT = """You are a meeting analyst. You will receive a JSON array of structured
+meeting summaries. Each item covers part of the same meeting (or is a partially
+merged result). Merge them into ONE final structured summary.
+
+Output format (strict JSON, no markdown):
+{
+  "title": "meeting title",
+  "topics": [
+    {
+      "title": "topic title",
+      "summary": "brief summary of what was discussed",
+      "key_points": ["point 1", "point 2"],
+      "decisions": ["decision made, if any"],
+      "action_items": ["action item, if any"],
+      "time_range": {"start": 0.0, "end": 0.0}
+    }
+  ],
+  "participants_detected": ["speaker patterns if identifiable"],
+  "overall_summary": "1-2 sentence summary of the entire meeting"
+}
+
+Rules:
+- Combine topics that cover the same subject; use a time_range that spans both
+- Keep timestamps as numbers (seconds)
+- Do NOT include source_segments; they are re-attached programmatically later
+- Keep the original language of the content
+- Output ONLY valid JSON, no explanations"""
+
+
+# Keys kept on each topic when chunk summaries are fed to the synthesis merge
+# (source_segments are stripped and backfilled from the transcript afterwards).
+_TOPIC_MERGE_KEYS = ("title", "summary", "key_points", "decisions", "action_items", "time_range")
+
+# Number of representative quotes backfilled per merged topic.
+_BACKFILL_TOP_N = 5
+
+
 def structurize_transcript(
     input_path: str,
     output_dir: str,
@@ -44,11 +87,14 @@ def structurize_transcript(
     whisper_model: str = "medium",
     llm_model: str = "qwen3.6-35b-a3b-mtp",
     lm_studio_url: str = "http://localhost:1234/v1",
+    context_tokens: int = 8192,
     progress_callback=None,
 ) -> dict:
     """Convert a recording or transcript to structured meeting notes.
 
     input_path: video/audio file, or .srt/.json transcript file
+    context_tokens: model context size used for token-budget chunking
+                    (a single chunk is capped at half of this).
     Returns {"structured": str, "transcript": str, "topics": int}
     """
     output_dir = Path(output_dir)
@@ -65,7 +111,7 @@ def structurize_transcript(
     transcript_path.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")
 
     srt_path = output_dir / "transcript.srt"
-    _write_srt(segments, str(srt_path))
+    write_srt(segments, str(srt_path))
 
     # Step 2: Send to LLM for structuring (chunked for long transcripts)
     if progress_callback:
@@ -73,49 +119,50 @@ def structurize_transcript(
 
     llm = LMStudioClient(base_url=lm_studio_url, model=llm_model)
 
-    # Split into ~5 minute chunks to fit context window
-    chunk_size = 50
-    chunks = [segments[i:i + chunk_size] for i in range(0, len(segments), chunk_size)]
+    # Token-budget chunking: a single chunk is capped at half the model context.
+    chunk_budget = max(1, context_tokens // 2)
+    chunks = _chunk_segments(segments, chunk_budget)
 
     if len(chunks) <= 1:
         transcript_text = _format_transcript_for_llm(segments)
-        raw_response = llm.complete(
+        structured = _complete_and_parse(
+            llm,
             prompt="Analyze this meeting transcript and produce structured notes:\n\n%s" % transcript_text,
             system=SYSTEM_PROMPT,
-            temperature=0.2,
+            what="transcript structuring",
         )
-        structured = _parse_llm_response(raw_response)
     else:
-        # Multi-chunk: summarize each chunk, then synthesize
+        # Multi-chunk: summarize each chunk, then synthesize hierarchically
         chunk_summaries = []
         for ci, chunk in enumerate(chunks):
             if progress_callback:
                 progress_callback("structuring", 0.4 + 0.3 * (ci + 1) / len(chunks))
 
             chunk_text = _format_transcript_for_llm(chunk)
-            raw = llm.complete(
+            summary = _complete_and_parse(
+                llm,
                 prompt="Analyze this transcript chunk (%d/%d) and produce structured notes:\n\n%s" % (
                     ci + 1, len(chunks), chunk_text),
                 system=SYSTEM_PROMPT,
-                temperature=0.2,
+                what="chunk %d/%d" % (ci + 1, len(chunks)),
             )
-            chunk_summaries.append(_parse_llm_response(raw))
+            chunk_summaries.append(summary)
 
-        # Synthesize all chunk summaries
+        # Synthesize: strip quotes, tree-merge under token budget, backfill quotes
         if progress_callback:
             progress_callback("synthesizing", 0.75)
 
-        synthesis_input = json.dumps(chunk_summaries, ensure_ascii=False)
-        raw_response = llm.complete(
-            prompt=(
-                "You have %d chunk summaries from a meeting. "
-                "Merge them into ONE final structured report. "
-                "Combine related topics, keep all timestamps and source references.\n\n%s"
-            ) % (len(chunk_summaries), synthesis_input),
-            system=SYSTEM_PROMPT,
-            temperature=0.2,
+        stripped = [_strip_source_segments(cs) for cs in chunk_summaries]
+        structured = merge_structured(
+            stripped,
+            llm,
+            merge_prompt=SYNTHESIS_MERGE_PROMPT,
+            budget_tokens=chunk_budget,
         )
-        structured = _parse_llm_response(raw_response)
+        if not isinstance(structured, dict):
+            raise RuntimeError(
+                "Synthesis merge returned %s, expected a JSON object" % type(structured).__name__)
+        _backfill_source_segments(structured, segments, top_n=_BACKFILL_TOP_N)
 
     # Parse and save structured output
     if progress_callback:
@@ -131,7 +178,7 @@ def structurize_transcript(
 
     # Generate HTML
     html_path = output_dir / "notes.html"
-    html_content = _generate_html(md_content, structured)
+    html_content = _generate_html(structured)
     html_path.write_text(html_content, encoding="utf-8")
 
     if progress_callback:
@@ -147,92 +194,149 @@ def structurize_transcript(
     }
 
 
-def _write_srt(segments: list[dict], output_path: str):
-    """Write segments to SRT format."""
-    with open(output_path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(segments, 1):
-            start = _format_srt_time(seg["start"])
-            end = _format_srt_time(seg["end"])
-            f.write(f"{i}\n{start} --> {end}\n{seg['text']}\n\n")
-
-
-def _format_srt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
 def _load_or_transcribe(input_path: str, language: str, model: str) -> list[dict]:
     """Load existing transcript or run whisper."""
     p = Path(input_path)
 
-    if p.suffix == ".json":
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    if p.suffix == ".srt":
-        return _parse_srt(str(p))
+    if p.suffix.lower() in (".json", ".srt"):
+        return load_transcript(str(p))
 
     return transcribe_audio(str(p), language=language, model=model)
 
 
-def _parse_srt(srt_path: str) -> list[dict]:
-    """Parse SRT file into segments."""
-    segments = []
-    with open(srt_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    for block in content.strip().split("\n\n"):
-        parts = block.split("\n")
-        if len(parts) >= 3:
-            time_str = parts[1]
-            text = " ".join(parts[2:])
-            start_str, end_str = time_str.split(" --> ")
-            segments.append({
-                "start": _srt_time_to_seconds(start_str),
-                "end": _srt_time_to_seconds(end_str),
-                "text": text.strip(),
-            })
-    return segments
+def _estimate_tokens(text: str) -> int:
+    """Conservative token estimate for CJK-heavy text (~1.5 chars/token)."""
+    return int(len(text) // 1.5)
 
 
-def _srt_time_to_seconds(time_str: str) -> float:
-    h, m, rest = time_str.replace(",", ".").split(":")
-    return int(h) * 3600 + int(m) * 60 + float(rest)
+def _chunk_segments(segments: list[dict], budget_tokens: int) -> list[list[dict]]:
+    """Split segments into chunks whose formatted text fits the token budget."""
+    chunks = []
+    current = []
+    current_tokens = 0
+    for seg in segments:
+        cost = _estimate_tokens(_format_segment_line(seg))
+        if current and current_tokens + cost > budget_tokens:
+            chunks.append(current)
+            current = []
+            current_tokens = 0
+        current.append(seg)
+        current_tokens += cost
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _format_segment_line(seg: dict) -> str:
+    start = format_time(seg.get("start", 0))
+    end = format_time(seg.get("end", 0))
+    return "[%s - %s] %s" % (start, end, seg.get("text", ""))
 
 
 def _format_transcript_for_llm(segments: list[dict]) -> str:
     """Format segments into readable transcript with timestamps."""
-    lines = []
-    for seg in segments:
-        start = _format_time(seg["start"])
-        end = _format_time(seg["end"])
-        lines.append(f"[{start} - {end}] {seg['text']}")
-    return "\n".join(lines)
+    return "\n".join(_format_segment_line(seg) for seg in segments)
 
 
-def _format_time(seconds: float) -> str:
-    m = int(seconds // 60)
-    s = int(seconds % 60)
-    return f"{m:02d}:{s:02d}"
-
-
-def _parse_llm_response(response: str) -> dict:
-    """Extract JSON from LLM response, handling potential markdown wrapping."""
-    text = response.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = lines[1:]  # skip ```json
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines)
-
+def _complete_and_parse(llm, prompt: str, system: str, what: str) -> dict:
+    """LLM call + JSON extraction; one retry at temperature=0, then raise."""
+    raw = llm.complete(prompt=prompt, system=system, temperature=0.2)
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return {"title": "Parse Error", "topics": [], "overall_summary": text[:500]}
+        result = extract_json(raw)
+        if isinstance(result, dict):
+            return result
+    except ValueError:
+        pass
+
+    raw = llm.complete(prompt=prompt, system=system, temperature=0)
+    try:
+        result = extract_json(raw)
+    except ValueError as e:
+        raise RuntimeError(
+            "LLM returned unparseable JSON for %s (after retry at temperature=0): %s"
+            % (what, e))
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "LLM returned JSON %s for %s, expected an object"
+            % (type(result).__name__, what))
+    return result
+
+
+def _strip_source_segments(summary: dict) -> dict:
+    """Drop source_segments (and unknown keys) from each topic before merging."""
+    out = {k: v for k, v in summary.items() if k != "topics"}
+    topics = []
+    for topic in summary.get("topics", []) or []:
+        if isinstance(topic, dict):
+            topics.append({k: topic[k] for k in _TOPIC_MERGE_KEYS if k in topic})
+    out["topics"] = topics
+    return out
+
+
+def _coerce_seconds(value, default=0.0) -> float:
+    """Best-effort conversion of an LLM-provided timestamp to seconds."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace(",", ".")
+        if not text:
+            return default
+        if ":" in text:
+            try:
+                nums = [float(p) for p in text.split(":")]
+            except ValueError:
+                return default
+            secs = 0.0
+            for n in nums:
+                secs = secs * 60 + n
+            return secs
+        try:
+            return float(text)
+        except ValueError:
+            return default
+    return default
+
+
+def _backfill_source_segments(structured: dict, segments: list[dict], top_n: int = _BACKFILL_TOP_N):
+    """Re-attach representative quotes to each merged topic from the original
+    transcript, using the topic's time_range (programmatic — no LLM, so
+    timestamps cannot be hallucinated)."""
+    for topic in structured.get("topics", []) or []:
+        if not isinstance(topic, dict):
+            continue
+        time_range = topic.get("time_range") or {}
+        if not isinstance(time_range, dict):
+            time_range = {}
+        start = _coerce_seconds(time_range.get("start"), 0.0)
+        end = _coerce_seconds(time_range.get("end"), start)
+        if end < start:
+            start, end = end, start
+
+        in_range = [
+            s for s in segments
+            if _coerce_seconds(s.get("end"), 0.0) >= start
+            and _coerce_seconds(s.get("start"), 0.0) <= end
+            and str(s.get("text", "")).strip()
+        ]
+        # Longest segments as representatives, re-sorted chronologically
+        picked = sorted(in_range, key=lambda s: len(str(s.get("text", ""))), reverse=True)[:top_n]
+        picked.sort(key=lambda s: _coerce_seconds(s.get("start"), 0.0))
+
+        topic["source_segments"] = [
+            {"start": s.get("start"), "end": s.get("end"), "text": s.get("text", "")}
+            for s in picked
+        ]
+    return structured
+
+
+def _safe_format_time(value) -> str:
+    """format_time that never raises on LLM-provided garbage (None, etc.)."""
+    try:
+        return format_time(value)
+    except ValueError:
+        return format_time(_coerce_seconds(value, 0.0))
 
 
 def _generate_markdown(structured: dict, segments: list[dict]) -> str:
@@ -253,8 +357,8 @@ def _generate_markdown(structured: dict, segments: list[dict]) -> str:
 
     for i, topic in enumerate(structured.get("topics", []), 1):
         time_range = topic.get("time_range", {})
-        start = _format_time(time_range.get("start", 0))
-        end = _format_time(time_range.get("end", 0))
+        start = _safe_format_time(time_range.get("start", 0))
+        end = _safe_format_time(time_range.get("end", 0))
 
         lines.append(f"## {i}. {topic.get('title', 'Untitled')} [{start} - {end}]\n")
         lines.append(f"{topic.get('summary', '')}\n")
@@ -284,59 +388,62 @@ def _generate_markdown(structured: dict, segments: list[dict]) -> str:
         if sources:
             lines.append("### Source References")
             for src in sources:
-                s = _format_time(src.get("start", 0))
-                e = _format_time(src.get("end", 0))
+                s = _safe_format_time(src.get("start", 0))
+                e = _safe_format_time(src.get("end", 0))
                 lines.append(f"> [{s}-{e}] \"{src.get('text', '')}\"")
             lines.append("")
 
     return "\n".join(lines)
 
 
-def _generate_html(markdown_text: str, structured: dict) -> str:
-    """Generate HTML with clickable timestamp references."""
-    lines = []
-    lines.append("<!DOCTYPE html><html><head><meta charset='utf-8'>")
-    lines.append("<title>{}</title>".format(structured.get("title", "Meeting Notes")))
-    lines.append("<style>")
-    lines.append("body{font-family:sans-serif;max-width:900px;margin:0 auto;padding:20px;line-height:1.6}")
-    lines.append("h1{color:#1a1a2e} h2{color:#16213e;border-bottom:1px solid #ddd;padding-bottom:5px}")
-    lines.append(".time{color:#e94560;font-family:monospace;font-weight:bold}")
-    lines.append("blockquote{border-left:3px solid #e94560;padding-left:10px;color:#555;margin:10px 0}")
-    lines.append(".topic{margin:25px 0;padding:15px;background:#f8f9fa;border-radius:8px}")
-    lines.append(".action{color:#0f3460} .decision{color:#533483}")
-    lines.append("</style></head><body>")
+_HTML_CSS = """
+body{font-family:sans-serif;max-width:900px;margin:0 auto;padding:20px;line-height:1.6}
+h1{color:#1a1a2e} h2{color:#16213e;border-bottom:1px solid #ddd;padding-bottom:5px}
+.time{color:#e94560;font-family:monospace;font-weight:bold}
+blockquote{border-left:3px solid #e94560;padding-left:10px;color:#555;margin:10px 0}
+.topic{margin:25px 0;padding:15px;background:#f8f9fa;border-radius:8px}
+.action{color:#0f3460} .decision{color:#533483}
+""".strip()
 
+
+def _generate_html(structured: dict) -> str:
+    """Generate an HTML report (all LLM-derived text escaped)."""
+    lines = []
     title = structured.get("title", "Meeting Notes")
-    lines.append(f"<h1>{title}</h1>")
+    lines.append("<h1>%s</h1>" % esc(title))
 
     summary = structured.get("overall_summary", "")
     if summary:
-        lines.append(f"<p><strong>Summary:</strong> {summary}</p>")
+        lines.append("<p><strong>Summary:</strong> %s</p>" % esc(summary))
 
     for i, topic in enumerate(structured.get("topics", []), 1):
         time_range = topic.get("time_range", {})
-        start = _format_time(time_range.get("start", 0))
-        end = _format_time(time_range.get("end", 0))
+        start = _safe_format_time(time_range.get("start", 0))
+        end = _safe_format_time(time_range.get("end", 0))
 
-        lines.append(f'<div class="topic">')
-        lines.append(f'<h2>{i}. {topic.get("title", "")} <span class="time">[{start} - {end}]</span></h2>')
-        lines.append(f'<p>{topic.get("summary", "")}</p>')
+        lines.append('<div class="topic">')
+        lines.append('<h2>%d. %s <span class="time">[%s - %s]</span></h2>' % (
+            i, esc(topic.get("title", "")), esc(start), esc(end)))
+        lines.append("<p>%s</p>" % esc(topic.get("summary", "")))
 
+        items = []
         for point in topic.get("key_points", []):
-            lines.append(f"<li>{point}</li>")
-
+            items.append("<li>%s</li>" % esc(point))
         for d in topic.get("decisions", []):
-            lines.append(f'<li class="decision">Decision: {d}</li>')
-
+            items.append('<li class="decision">Decision: %s</li>' % esc(d))
         for a in topic.get("action_items", []):
-            lines.append(f'<li class="action">TODO: {a}</li>')
+            items.append('<li class="action">TODO: %s</li>' % esc(a))
+        if items:
+            lines.append("<ul>")
+            lines.extend(items)
+            lines.append("</ul>")
 
         for src in topic.get("source_segments", []):
-            s = _format_time(src.get("start", 0))
-            e = _format_time(src.get("end", 0))
-            lines.append(f'<blockquote><span class="time">[{s}-{e}]</span> "{src.get("text", "")}"</blockquote>')
+            s = _safe_format_time(src.get("start", 0))
+            e = _safe_format_time(src.get("end", 0))
+            lines.append('<blockquote><span class="time">[%s-%s]</span> "%s"</blockquote>' % (
+                esc(s), esc(e), esc(src.get("text", ""))))
 
         lines.append("</div>")
 
-    lines.append("</body></html>")
-    return "\n".join(lines)
+    return html_page(title, "\n".join(lines), css=_HTML_CSS)

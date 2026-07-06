@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--whisper-model", default="medium", help="Whisper model size (default: medium)")
     parser.add_argument("--llm-model", default="qwen3.6-35b-a3b-mtp", help="LM Studio model for structuring")
     parser.add_argument("--url", default="http://localhost:1234/v1", help="LM Studio API URL")
+    parser.add_argument("--context-tokens", type=int, default=8192,
+                        help="LLM context size in tokens for chunking budget (default: 8192)")
 
     args = parser.parse_args()
 
@@ -29,6 +31,7 @@ def main():
         stages = {
             "transcribing": "Transcribing audio",
             "structuring": "Structuring with LLM",
+            "synthesizing": "Synthesizing chunk summaries",
             "saving": "Saving output",
             "done": "Done",
         }
@@ -36,15 +39,20 @@ def main():
         print(f"\r[{pct:.0%}] {label}...", end="", flush=True)
 
     print(f"Processing: {input_path}")
-    result = structurize_transcript(
-        str(input_path),
-        output_dir,
-        language=args.language,
-        whisper_model=args.whisper_model,
-        llm_model=args.llm_model,
-        lm_studio_url=args.url,
-        progress_callback=on_progress,
-    )
+    try:
+        result = structurize_transcript(
+            str(input_path),
+            output_dir,
+            language=args.language,
+            whisper_model=args.whisper_model,
+            llm_model=args.llm_model,
+            lm_studio_url=args.url,
+            context_tokens=args.context_tokens,
+            progress_callback=on_progress,
+        )
+    except (RuntimeError, ValueError) as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"\nDone! {result['topics']} topics found")
     print(f"  Structured: {result['structured']}")
     print(f"  Transcript: {result['transcript']}")
