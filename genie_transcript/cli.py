@@ -13,7 +13,7 @@ def main():
     parser.add_argument("-o", "--output", help="Output directory (default: <input>_notes/)")
     parser.add_argument("--language", default="zh", help="Whisper language hint (default: zh)")
     parser.add_argument("--whisper-model", default="medium", help="Whisper model size (default: medium)")
-    parser.add_argument("--llm-model", default="qwen3.6-35b-a3b-mtp", help="LM Studio model for structuring")
+    parser.add_argument("--llm-model", default=None, help="LM Studio model for structuring (default: auto-pick)")
     parser.add_argument("--url", default="http://localhost:1234/v1", help="LM Studio API URL")
     parser.add_argument("--context-tokens", type=int, default=8192,
                         help="LLM context size in tokens for chunking budget (default: 8192)")
