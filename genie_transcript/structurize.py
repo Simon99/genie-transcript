@@ -276,7 +276,7 @@ def _complete_and_parse(llm, prompt: str, system: str, what: str,
         prompt + "\n\nREMINDER: the output MUST be a JSON object with a "
                  "top-level \"%s\" array, exactly as the schema specifies."
         % required_key)
-    raw = llm.complete(prompt=reminder, system=system, temperature=0, max_tokens=4096)
+    raw = llm.complete(prompt=reminder, system=system, temperature=0, max_tokens=8192)
     try:
         result = extract_json(raw)
     except ValueError as e:
