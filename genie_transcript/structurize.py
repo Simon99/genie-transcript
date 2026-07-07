@@ -240,7 +240,7 @@ def _format_transcript_for_llm(segments: list[dict]) -> str:
 
 def _complete_and_parse(llm, prompt: str, system: str, what: str) -> dict:
     """LLM call + JSON extraction; one retry at temperature=0, then raise."""
-    raw = llm.complete(prompt=prompt, system=system, temperature=0.2)
+    raw = llm.complete(prompt=prompt, system=system, temperature=0.2, max_tokens=4096)
     try:
         result = extract_json(raw)
         if isinstance(result, dict):
@@ -248,7 +248,7 @@ def _complete_and_parse(llm, prompt: str, system: str, what: str) -> dict:
     except ValueError:
         pass
 
-    raw = llm.complete(prompt=prompt, system=system, temperature=0)
+    raw = llm.complete(prompt=prompt, system=system, temperature=0, max_tokens=4096)
     try:
         result = extract_json(raw)
     except ValueError as e:
