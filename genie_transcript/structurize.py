@@ -85,16 +85,17 @@ def structurize_transcript(
     output_dir: str,
     language: str = "zh",
     whisper_model: str = "medium",
-    llm_model: str = "qwen3.6-35b-a3b-mtp",
+    llm_model: str = None,
     lm_studio_url: str = "http://localhost:1234/v1",
-    context_tokens: int = 8192,
+    context_tokens: int = None,
     progress_callback=None,
 ) -> dict:
     """Convert a recording or transcript to structured meeting notes.
 
     input_path: video/audio file, or .srt/.json transcript file
     context_tokens: model context size used for token-budget chunking
-                    (a single chunk is capped at half of this).
+                    (a single chunk is capped at half of this); None
+                    auto-detects from LM Studio, falling back to 8192.
     Returns {"structured": str, "transcript": str, "topics": int}
     """
     output_dir = Path(output_dir)
@@ -119,8 +120,14 @@ def structurize_transcript(
 
     llm = LMStudioClient(base_url=lm_studio_url, model=llm_model)
 
-    # Token-budget chunking: a single chunk is capped at half the model context.
-    chunk_budget = max(1, context_tokens // 2)
+    if context_tokens is None:
+        context_tokens = llm.get_context_length(default=8192)
+        print("Model context: %d tokens" % context_tokens)
+
+    # Token-budget chunking: a single chunk is capped at half the model
+    # context, and additionally at 32k so the chunk's structured summary
+    # still fits comfortably in the generation budget.
+    chunk_budget = min(max(1, context_tokens // 2), 32768)
     chunks = _chunk_segments(segments, chunk_budget)
 
     if len(chunks) <= 1:
@@ -130,6 +137,7 @@ def structurize_transcript(
             prompt="Analyze this meeting transcript and produce structured notes:\n\n%s" % transcript_text,
             system=SYSTEM_PROMPT,
             what="transcript structuring",
+            required_key="topics",
         )
     else:
         # Multi-chunk: summarize each chunk, then synthesize hierarchically
@@ -145,6 +153,7 @@ def structurize_transcript(
                     ci + 1, len(chunks), chunk_text),
                 system=SYSTEM_PROMPT,
                 what="chunk %d/%d" % (ci + 1, len(chunks)),
+                required_key="topics",
             )
             chunk_summaries.append(summary)
 
@@ -238,27 +247,42 @@ def _format_transcript_for_llm(segments: list[dict]) -> str:
     return "\n".join(_format_segment_line(seg) for seg in segments)
 
 
-def _complete_and_parse(llm, prompt: str, system: str, what: str) -> dict:
-    """LLM call + JSON extraction; one retry at temperature=0, then raise."""
+def _complete_and_parse(llm, prompt: str, system: str, what: str,
+                        required_key: str = None) -> dict:
+    """LLM call + JSON extraction; one retry at temperature=0, then raise.
+
+    required_key: schema anchor (e.g. "topics"). Models sometimes return
+    perfectly valid JSON in a different shape (observed live: single-chunk
+    path got title/summary/key_points with no topics array); the retry
+    appends an explicit reminder, and a still-wrong shape raises.
+    """
+    def _ok(result):
+        return (isinstance(result, dict)
+                and (required_key is None or required_key in result))
+
     raw = llm.complete(prompt=prompt, system=system, temperature=0.2, max_tokens=4096)
     try:
         result = extract_json(raw)
-        if isinstance(result, dict):
+        if _ok(result):
             return result
     except ValueError:
         pass
 
-    raw = llm.complete(prompt=prompt, system=system, temperature=0, max_tokens=4096)
+    reminder = prompt if required_key is None else (
+        prompt + "\n\nREMINDER: the output MUST be a JSON object with a "
+                 "top-level \"%s\" array, exactly as the schema specifies."
+        % required_key)
+    raw = llm.complete(prompt=reminder, system=system, temperature=0, max_tokens=4096)
     try:
         result = extract_json(raw)
     except ValueError as e:
         raise RuntimeError(
             "LLM returned unparseable JSON for %s (after retry at temperature=0): %s"
             % (what, e))
-    if not isinstance(result, dict):
+    if not _ok(result):
         raise RuntimeError(
-            "LLM returned JSON %s for %s, expected an object"
-            % (type(result).__name__, what))
+            "LLM output for %s is missing required key %r (after retry)"
+            % (what, required_key))
     return result
 
 

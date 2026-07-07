@@ -15,8 +15,8 @@ def main():
     parser.add_argument("--whisper-model", default="medium", help="Whisper model size (default: medium)")
     parser.add_argument("--llm-model", default=None, help="LM Studio model for structuring (default: auto-pick)")
     parser.add_argument("--url", default="http://localhost:1234/v1", help="LM Studio API URL")
-    parser.add_argument("--context-tokens", type=int, default=8192,
-                        help="LLM context size in tokens for chunking budget (default: 8192)")
+    parser.add_argument("--context-tokens", type=int, default=None,
+                        help="LLM context size for chunking budget (default: auto-detect from LM Studio)")
 
     args = parser.parse_args()
 
