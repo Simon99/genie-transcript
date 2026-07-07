@@ -167,6 +167,7 @@ def structurize_transcript(
             llm,
             merge_prompt=SYNTHESIS_MERGE_PROMPT,
             budget_tokens=chunk_budget,
+            required_key="topics",
         )
         if not isinstance(structured, dict):
             raise RuntimeError(
