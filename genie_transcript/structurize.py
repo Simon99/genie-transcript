@@ -88,6 +88,7 @@ def structurize_transcript(
     output_dir: str,
     language: str = "zh",
     whisper_model: str = "medium",
+    whisper_backend: str = "auto",
     llm_model: str = None,
     lm_studio_url: str = "http://localhost:1234/v1",
     context_tokens: int = None,
@@ -108,7 +109,7 @@ def structurize_transcript(
     if progress_callback:
         progress_callback("transcribing", 0)
 
-    segments = _load_or_transcribe(input_path, language, whisper_model)
+    segments = _load_or_transcribe(input_path, language, whisper_model, whisper_backend)
 
     # Save raw transcript
     transcript_path = output_dir / "transcript.json"
@@ -207,14 +208,15 @@ def structurize_transcript(
     }
 
 
-def _load_or_transcribe(input_path: str, language: str, model: str) -> list[dict]:
+def _load_or_transcribe(input_path: str, language: str, model: str,
+                        backend: str = "auto") -> list[dict]:
     """Load existing transcript or run whisper."""
     p = Path(input_path)
 
     if p.suffix.lower() in (".json", ".srt"):
         return load_transcript(str(p))
 
-    return transcribe_audio(str(p), language=language, model=model)
+    return transcribe_audio(str(p), language=language, model=model, backend=backend)
 
 
 def _estimate_tokens(text: str) -> int:

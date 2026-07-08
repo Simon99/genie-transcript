@@ -13,6 +13,10 @@ def main():
     parser.add_argument("-o", "--output", help="Output directory (default: <input>_notes/)")
     parser.add_argument("--language", default="zh", help="Whisper language hint (default: zh)")
     parser.add_argument("--whisper-model", default="medium", help="Whisper model size (default: medium)")
+    parser.add_argument("--whisper-backend", default="auto",
+                        choices=["auto", "mlx", "openai", "apple", "groq"],
+                        help="Transcription backend (groq = cloud whisper-large-v3, "
+                             "needs GROQ_API_KEY; audio leaves the machine)")
     parser.add_argument("--llm-model", default=None, help="LM Studio model for structuring (default: auto-pick)")
     parser.add_argument("--url", default="http://localhost:1234/v1", help="LM Studio API URL")
     parser.add_argument("--context-tokens", type=int, default=None,
@@ -45,6 +49,7 @@ def main():
             output_dir,
             language=args.language,
             whisper_model=args.whisper_model,
+            whisper_backend=args.whisper_backend,
             llm_model=args.llm_model,
             lm_studio_url=args.url,
             context_tokens=args.context_tokens,
